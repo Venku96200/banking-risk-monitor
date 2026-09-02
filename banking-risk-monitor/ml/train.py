@@ -1,5 +1,9 @@
 """
-Train an unsupervised Isolation Forest model.
+Train the Isolation Forest using 100,000 transactions
+from bank_fraud.csv.
+
+The model is unsupervised:
+is_fraud and fraud_type are never used.
 """
 
 import pickle
@@ -12,155 +16,237 @@ from sklearn.preprocessing import StandardScaler
 
 
 # --------------------------------------------------
-# 1. Columns used from the datasets
+# 1. Dataset
 # --------------------------------------------------
 
-PROJECT_COLUMNS = [
-    "transaction_id",
-    "customer_id",
-    "timestamp",
-    "amount",
-    "account_age_days"
-]
+DATA_PATH = "data/bank_fraud.csv"
 
-BANK_COLUMNS = [
-    "transaction_id",
-    "customer_id",
-    "transaction_date",
-    "transaction_time",
-    "hour_of_day",
-    "account_age_years",
-    "transaction_amount",
-    "transaction_freq_monthly",
-    "time_since_last_txn_hrs",
-    "device_type",
-    "city"
-]
+MODEL_PATH = "ml/model.pkl"
+
+SAMPLE_SIZE = 100_000
 
 
 # --------------------------------------------------
-# 2. Feature engineering for project dataset
+# 2. Create the same 9 features used by the API
 # --------------------------------------------------
 
-def project_features(path):
+def create_features(df):
 
-    df = pd.read_csv(path, usecols=PROJECT_COLUMNS)
-
-    # Convert timestamp from string to datetime
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    # Average transaction amount for each customer
-    average = df.groupby("customer_id")["amount"].transform("mean")
-
-    features = np.column_stack([
-        np.log1p(df["amount"]),
-        df["amount"] / average.clip(lower=1),
-
-        # These features are not available in this dataset,
-        # so we use default values.
-        np.ones(len(df)),
-        np.ones(len(df)),
-        np.full(len(df), 1440),
-        np.zeros(len(df)),
-        np.zeros(len(df)),
-
-        # Features that are available
-        df["timestamp"].dt.hour,
-        df["account_age_days"]
-    ])
-
-    return features
-
-
-# --------------------------------------------------
-# 3. Feature engineering for bank fraud dataset
-# --------------------------------------------------
-
-def bank_fraud_features(path, sample_size):
-
-    df = pd.read_csv(path, usecols=BANK_COLUMNS)
-
-    # Use only sample_size rows if dataset is larger
-    if len(df) > sample_size:
-        df = df.sample(sample_size, random_state=42)
-
-    # Combine date and time into one timestamp
+    # Make timestamp
     df["timestamp"] = pd.to_datetime(
         df["transaction_date"] + " " + df["transaction_time"]
     )
 
-    # Sort transactions customer-wise and chronologically
-    df = df.sort_values(["customer_id", "timestamp"])
+    # Sort chronologically for every customer
+    df = df.sort_values(
+        ["customer_id", "timestamp"]
+    ).reset_index(drop=True)
 
-    # Average transaction amount for each customer
-    average = df.groupby("customer_id")["transaction_amount"].transform("mean")
 
-    # First device used by each customer
-    first_device = df.groupby("customer_id")["device_type"].transform("first")
+    # ----------------------------------------------
+    # Feature 1 & 2: Amount
+    # ----------------------------------------------
 
-    # First city used by each customer
-    first_city = df.groupby("customer_id")["city"].transform("first")
+    customer_average = (
+        df.groupby("customer_id")["transaction_amount"]
+        .transform("mean")
+    )
 
-    # Time since previous transaction, in minutes
-    minutes = (
-        df["time_since_last_txn_hrs"]
-        .fillna(24)
-        * 60
-    ).clip(upper=10080)
+    amount_log = np.log1p(
+        df["transaction_amount"]
+    )
 
-    # Monthly transaction frequency
-    frequency = df["transaction_freq_monthly"].fillna(0)
+    amount_ratio = (
+        df["transaction_amount"]
+        / customer_average.clip(lower=1)
+    )
+
+
+    # ----------------------------------------------
+    # Feature 3: Transactions in previous 10 min
+    # ----------------------------------------------
+
+    velocity_10m = []
+
+    # ----------------------------------------------
+    # Feature 4: Transactions in previous 24 hours
+    # ----------------------------------------------
+
+    velocity_24h = []
+
+    # ----------------------------------------------
+    # Feature 5: Minutes since previous transaction
+    # ----------------------------------------------
+
+    minutes_since_previous = []
+
+
+    # Process each customer separately
+    for customer_id, group in df.groupby("customer_id"):
+
+        times = group["timestamp"].astype(
+            "int64"
+        ).to_numpy()
+
+        # Convert nanoseconds → minutes
+        times_minutes = times / (60 * 1_000_000_000)
+
+        for i in range(len(group)):
+
+            current_time = times_minutes[i]
+
+            # Previous transactions only
+            previous_times = times_minutes[:i]
+
+
+            # 10-minute velocity
+            count_10m = np.sum(
+                previous_times >= current_time - 10
+            )
+
+            velocity_10m.append(count_10m)
+
+
+            # 24-hour velocity
+            count_24h = np.sum(
+                previous_times >= current_time - 1440
+            )
+
+            velocity_24h.append(count_24h)
+
+
+            # Time since previous transaction
+            if i == 0:
+                minutes_since_previous.append(1440)
+            else:
+                minutes_since_previous.append(
+                    current_time - previous_times[-1]
+                )
+
+
+    # ----------------------------------------------
+    # Feature 6: New device
+    # ----------------------------------------------
+
+    new_device = (
+        ~df.duplicated(
+            ["customer_id", "device_type"],
+            keep="first"
+        )
+    ).astype(int)
+
+
+    # ----------------------------------------------
+    # Feature 7: New location
+    # ----------------------------------------------
+
+    new_location = (
+        ~df.duplicated(
+            ["customer_id", "city"],
+            keep="first"
+        )
+    ).astype(int)
+
+
+    # ----------------------------------------------
+    # Feature 8: Transaction hour
+    # ----------------------------------------------
+
+    hour = df["timestamp"].dt.hour
+
+
+    # ----------------------------------------------
+    # Feature 9: Account age
+    # ----------------------------------------------
+
+    account_age = (
+        df["account_age_years"] * 365
+    ).clip(lower=0)
+
+
+    # ----------------------------------------------
+    # Combine all 9 features
+    # ----------------------------------------------
 
     features = np.column_stack([
-        # 1. Transaction amount
-        np.log1p(df["transaction_amount"]),
 
-        # 2. Amount compared to customer's average
-        df["transaction_amount"] / average.clip(lower=1),
+        amount_log,
 
-        # 3. Approximate 10-minute transaction velocity
-        frequency / 30,
+        amount_ratio,
 
-        # 4. Monthly transaction frequency
-        frequency,
+        velocity_10m,
 
-        # 5. Minutes since previous transaction
-        minutes,
+        velocity_24h,
 
-        # 6. New device?
-        (df["device_type"] != first_device).astype(int),
+        minutes_since_previous,
 
-        # 7. New city?
-        (df["city"] != first_city).astype(int),
+        new_device,
 
-        # 8. Transaction hour
-        df["hour_of_day"],
+        new_location,
 
-        # 9. Account age in days
-        (df["account_age_years"] * 365).clip(lower=0)
+        hour,
+
+        account_age
     ])
+
 
     return features
 
 
 # --------------------------------------------------
-# 4. Train the model
+# 3. Train model
 # --------------------------------------------------
 
-def train(source, sample_size=100_000):
+def train():
 
-    # Read only the first row to determine which dataset we have
-    columns = pd.read_csv(source, nrows=1).columns
+    print("Loading bank fraud dataset...")
 
-    if "transaction_amount" in columns:
-        features = bank_fraud_features(source, sample_size)
-    else:
-        features = project_features(source)
+    df = pd.read_csv(DATA_PATH)
 
-    print("Number of transactions:", len(features))
-    print("Number of features:", features.shape[1])
+    print(
+        f"Loaded {len(df):,} transactions."
+    )
 
+
+    # ----------------------------------------------
+    # IMPORTANT:
+    # Create features BEFORE sampling.
+    # ----------------------------------------------
+
+    features = create_features(df)
+
+
+    print(
+        f"Created {features.shape[1]} features."
+    )
+
+
+    # ----------------------------------------------
+    # Take 100,000 transactions
+    # ----------------------------------------------
+
+    if len(features) > SAMPLE_SIZE:
+
+        rng = np.random.default_rng(42)
+
+        indices = rng.choice(
+            len(features),
+            SAMPLE_SIZE,
+            replace=False
+        )
+
+        features = features[indices]
+
+
+    print(
+        f"Training on {len(features):,} transactions."
+    )
+
+
+    # ----------------------------------------------
     # StandardScaler + Isolation Forest
+    # ----------------------------------------------
+
     model = make_pipeline(
 
         StandardScaler(),
@@ -173,20 +259,32 @@ def train(source, sample_size=100_000):
         )
     )
 
-    # Train the model
+
+    # Train
     model.fit(features)
 
-    # Save the entire pipeline
-    with open("ml/model.pkl", "wb") as file:
-        pickle.dump(model, file)
 
-    print("Model saved to ml/model.pkl")
+    # ----------------------------------------------
+    # Save model
+    # ----------------------------------------------
+
+    with open(MODEL_PATH, "wb") as file:
+
+        pickle.dump(
+            model,
+            file
+        )
+
+
+    print(
+        f"Model saved to {MODEL_PATH}"
+    )
 
 
 # --------------------------------------------------
-# 5. Run training
+# 4. Run
 # --------------------------------------------------
 
-source = "data/transactions.csv"
+if __name__ == "__main__":
 
-train(source)
+    train()
