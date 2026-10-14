@@ -1,2 +1,6 @@
-
-banking-risk-monitor/bank_fraud.csv
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+ml/model.pkl
